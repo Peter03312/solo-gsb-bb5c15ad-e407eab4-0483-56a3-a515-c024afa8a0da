@@ -9,7 +9,7 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.errors import RequestValidationErrors
-from app.models.common import EPS, _is_finite_number
+from app.models.common import _is_finite_number
 from app.models.analysis.usage import WindowRange
 from app.models.simulation.core import (
     BucketSpec,
@@ -30,7 +30,13 @@ class FairnessSimRequest(BaseModel):
     ]
     weight: Annotated[
         float,
-        Field(default=1.0, description="主体权重，必须为正的有限数值；缺省为 1.0"),
+        Field(
+            default=1.0,
+            description=(
+                "主体权重，必须为正的有限数值；缺省为 1.0；"
+                "同一 principal 的权重按真实数值精确比较，必须完全一致"
+            ),
+        ),
     ] = 1.0
 
     @field_validator("timestamp", mode="before")
@@ -108,13 +114,15 @@ class FairnessReportRequest(BaseModel):
     def _cross_validate(self):
         errors = _simulate_cross_validation_errors(self.buckets, self.requests)
 
-        # 同一 principal 的权重必须一致：加权 Jain 指数以主体为单位计算
+        # 同一 principal 的权重必须一致：加权 Jain 指数以主体为单位计算。
+        # 按真实数值精确比较，不用固定绝对容差——容差会把 1e-10 与 2e-10
+        # 这类本就不同的微小正权重误判为一致。
         principal_weight: dict[str, float] = {}
         for r_index, request in enumerate(self.requests):
             previous = principal_weight.get(request.principal)
             if previous is None:
                 principal_weight[request.principal] = float(request.weight)
-            elif abs(previous - float(request.weight)) > EPS:
+            elif previous != float(request.weight):
                 errors.append(
                     {
                         "type": "inconsistent_principal_weight",
@@ -136,7 +144,9 @@ class FairnessPrincipalRow(BaseModel):
     """单个主体在某个统计范围（全局或单个窗口）内的公平性数据。"""
 
     principal: Annotated[str, Field(description="主体标识")]
-    weight: Annotated[float, Field(description="主体权重")]
+    weight: Annotated[
+        float, Field(description="主体权重（正的有限数值，按输入原值返回，不做舍入）")
+    ]
     request_count: Annotated[int, Field(description="该范围内该主体的请求总数")]
     allowed_count: Annotated[int, Field(description="放行请求数")]
     rejected_count: Annotated[int, Field(description="被原子拒绝的请求数")]
@@ -145,7 +155,12 @@ class FairnessPrincipalRow(BaseModel):
     ]
     theoretical_share: Annotated[
         float,
-        Field(description="理论权重份额 = 该范围全部放行消耗 × weight / 权重合计"),
+        Field(
+            description=(
+                "理论权重份额 = 该范围全部放行消耗 × weight / 权重合计"
+                "（按未舍入的权重与放行消耗计算）"
+            )
+        ),
     ]
     deficit: Annotated[
         float, Field(description="短缺量 = max(0, theoretical_share - allowed_consumption)")
@@ -184,7 +199,8 @@ class FairnessScopeReport(BaseModel):
         Field(
             description=(
                 "加权 Jain 公平指数 = (Σ x)² / (Σ w · Σ x²/w)，"
-                "x 为主体实际获得量、w 为权重；取值 (0, 1]，越大越公平"
+                "x 为主体实际获得量、w 为权重；取值 [0, 1]，越大越公平；"
+                "按未舍入的权重与获得量计算，仅当获得量合计为 0 时为 0"
             )
         ),
     ]

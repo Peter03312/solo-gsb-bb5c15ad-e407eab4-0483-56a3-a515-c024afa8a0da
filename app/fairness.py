@@ -9,6 +9,11 @@
 - 找出短缺比例最高且有被拒请求的最受限 principal，以及按处理顺序
   首个造成其短缺的拒绝（链上第一个余额不足的桶）。
 
+权重总和、理论份额、短缺比例与加权 Jain 指数全部基于未舍入的权重与
+实际获得量计算：任意小的正权重都按真实数值参与加权，不会被舍入为 0；
+仅当实际获得量合计为 0 时指数定义为 0。响应中的 weight 保留输入的
+正权重原值，不做数值舍入。
+
 统计同时给出跨全部窗口的全局报告与逐窗口报告。
 """
 from __future__ import annotations
@@ -32,17 +37,20 @@ def _weighted_jain_index(allocations: list[float], weights: list[float]) -> floa
     """加权 Jain 公平指数：(Σx)² / (Σw · Σx²/w)。
 
     等权重时退化为经典 Jain 指数 (Σx)² / (n·Σx²)。份额完全按权重比例时
-    取最大值 1；全部主体获得量为 0 时定义为 0（无可分配量，无公平性可言）。
+    取最大值 1；获得量合计为 0 时定义为 0（无可分配量，无公平性可言）。
+
+    权重与获得量按传入的真实数值直接计算，不做容差吸附：任意小的正权重
+    都正常参与加权，不会被当作 0，也不会因此触发除零。
     """
     total_x = sum(allocations)
-    if total_x <= EPS:
+    if total_x <= 0:
         return 0.0
     total_w = sum(weights)
     weighted_squares = sum(
-        (x * x) / w for x, w in zip(allocations, weights) if x > EPS
+        (x * x) / w for x, w in zip(allocations, weights) if x > 0
     )
     denominator = total_w * weighted_squares
-    if denominator <= EPS:
+    if denominator <= 0:
         return 0.0
     return _round(min(1.0, max(0.0, (total_x * total_x) / denominator)))
 
@@ -187,18 +195,21 @@ def fairness_report(payload: FairnessReportRequest) -> FairnessReportResponse:
 
         rows: list[FairnessPrincipalRow] = []
         for p in members:
+            # 份额与短缺比例基于未舍入的真实数值：权重只要求为正（输入校验
+            # 保证），任意小的正权重都正常参与份额分配，不被容差吸附为 0
             share = (
                 total_consumption * principal_weight[p] / total_weight
-                if total_weight > EPS
+                if total_weight > 0
                 else 0.0
             )
             got = consumption.get(p, 0.0)
             deficit = max(0.0, share - got)
-            deficit_ratio = deficit / share if share > EPS else 0.0
+            deficit_ratio = deficit / share if share > 0 else 0.0
             rows.append(
                 FairnessPrincipalRow(
                     principal=p,
-                    weight=_round(principal_weight[p]),
+                    # 正权重按输入原值返回，不做数值舍入（避免小权重被舍成 0）
+                    weight=principal_weight[p],
                     request_count=req_counts.get(p, 0),
                     allowed_count=allow_counts.get(p, 0),
                     rejected_count=reject_counts.get(p, 0),
@@ -209,9 +220,10 @@ def fairness_report(payload: FairnessReportRequest) -> FairnessReportResponse:
                 )
             )
 
+        # 加权 Jain 指数同样基于未舍入的权重与实际获得量计算
         jain = _weighted_jain_index(
-            [r.allowed_consumption for r in rows],
-            [r.weight for r in rows],
+            [consumption.get(p, 0.0) for p in members],
+            [principal_weight[p] for p in members],
         )
 
         # 最受限主体：在有被拒请求的主体中取短缺比例最高者；

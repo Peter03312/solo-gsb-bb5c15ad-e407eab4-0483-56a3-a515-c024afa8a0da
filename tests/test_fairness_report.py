@@ -44,6 +44,14 @@ def test_weighted_jain_formula():
     assert _weighted_jain_index([3.0, 0.0], [2.0, 1.0]) == pytest.approx(2 / 3, abs=1e-9)
 
 
+def test_weighted_jain_tiny_weights():
+    # 微小正权重按真实数值参与计算，不被舍入为 0：x=(1,1), w=(1e-10,2e-10)
+    # -> 4 / (3e-10 · (1e10 + 5e9)) = 8/9
+    assert _weighted_jain_index([1.0, 1.0], [1e-10, 2e-10]) == pytest.approx(8 / 9, abs=1e-9)
+    # 获得量合计再小但非 0 也不定义为 0：x=(1e-12, 0) 等权 -> 0.5
+    assert _weighted_jain_index([1e-12, 0.0], [1.0, 1.0]) == 0.5
+
+
 # ---------- 引擎语义 ----------
 
 def test_single_window_equal_weights():
@@ -428,6 +436,55 @@ def test_default_weight_is_one():
     }
 
 
+def test_tiny_positive_weights_not_rounded_to_zero():
+    # 回归：1e-10 / 2e-10 的合法正权重曾被响应舍入为 0，导致加权 Jain 指数
+    # 除零、理论份额误报为 0；现在响应保留权重原值，统计基于未舍入数值
+    resp = _run(
+        [{"id": "A", "capacity": 2, "refill_rate": 0}],
+        [
+            {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "alpha", "weight": 1e-10},
+            {"id": "r2", "timestamp": 1, "cost": 1, "chain": ["A"], "principal": "beta", "weight": 2e-10},
+        ],
+        window_seconds=10,
+    )
+    g = resp.global_report
+    alpha, beta = _principal(g, "alpha"), _principal(g, "beta")
+    assert alpha.weight == 1e-10 and beta.weight == 2e-10
+    # 总放行消耗 2 按 1:2 分配 -> 份额 2/3 与 4/3，均非 0
+    assert alpha.theoretical_share == pytest.approx(2 / 3, abs=1e-9)
+    assert beta.theoretical_share == pytest.approx(4 / 3, abs=1e-9)
+    assert alpha.deficit == 0
+    assert beta.deficit == pytest.approx(1 / 3, abs=1e-9)
+    assert beta.deficit_ratio == pytest.approx(0.25, abs=1e-9)
+    # 4 / (3e-10 · 1.5e10) = 8/9，不再触发除零
+    assert g.weighted_jain_index == pytest.approx(8 / 9, abs=1e-9)
+    # 单窗口时逐窗统计与全局一致
+    w0 = _window(resp, 0)
+    assert w0.weighted_jain_index == g.weighted_jain_index
+    assert _principal(w0, "alpha").weight == 1e-10
+    assert _principal(w0, "beta").theoretical_share == beta.theoretical_share
+
+
+def test_tiny_weights_with_zero_allocation_principal():
+    # 小权重 + 获得量为 0 的主体：指数按未舍入权重计算，x=0 项不触发除零
+    resp = _run(
+        [{"id": "A", "capacity": 1, "refill_rate": 0}],
+        [
+            {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "alpha", "weight": 1e-10},
+            {"id": "r2", "timestamp": 1, "cost": 1, "chain": ["A"], "principal": "beta", "weight": 2e-10},
+        ],
+        window_seconds=10,
+    )
+    g = resp.global_report
+    beta = _principal(g, "beta")
+    assert beta.allowed_consumption == 0
+    assert beta.theoretical_share == pytest.approx(2 / 3, abs=1e-9)
+    assert beta.deficit_ratio == 1
+    assert g.most_constrained_principal == "beta"
+    # x=(1,0), w=(1e-10,2e-10)：1 / (3e-10 · 1e10) = 1/3
+    assert g.weighted_jain_index == pytest.approx(1 / 3, abs=1e-9)
+
+
 # ---------- 校验 ----------
 
 def test_principal_must_be_nonempty_string():
@@ -478,6 +535,27 @@ def test_inconsistent_principal_weight_rejected():
             }
         )
     assert any(e["type"] == "inconsistent_principal_weight" for e in exc.value.errors)
+
+
+def test_inconsistent_tiny_weights_rejected_by_exact_value():
+    # 回归：固定绝对容差曾把 1e-10 与 2e-10 误判为一致；
+    # 现在按真实数值比较，422 定位到后一个请求的 weight 字段
+    with pytest.raises(RequestValidationErrors) as exc:
+        FairnessReportRequest.model_validate(
+            {
+                "buckets": [{"id": "A", "capacity": 10, "refill_rate": 0}],
+                "requests": [
+                    {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "p", "weight": 1e-10},
+                    {"id": "r2", "timestamp": 1, "cost": 1, "chain": ["A"], "principal": "p", "weight": 2e-10},
+                ],
+                "window_seconds": 1,
+            }
+        )
+    matches = [
+        e for e in exc.value.errors if e["type"] == "inconsistent_principal_weight"
+    ]
+    assert len(matches) == 1
+    assert matches[0]["loc"] == ("requests", 1, "weight")
 
 
 def test_shared_validation_still_applies():
@@ -607,6 +685,53 @@ def test_http_inconsistent_weight_is_422():
         e["type"] == "inconsistent_principal_weight"
         for e in response.json()["detail"]
     )
+
+
+def test_http_tiny_positive_weights_ok():
+    # 回归：1e-10 / 2e-10 的合法正权重曾使响应权重被舍入为 0 并触发除零；
+    # 现在 200 且权重保留原值、指数与理论份额按未舍入数值计算
+    response = client.post(
+        "/fairness-report",
+        json={
+            "buckets": [{"id": "A", "capacity": 2, "refill_rate": 0}],
+            "requests": [
+                {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "alpha", "weight": 1e-10},
+                {"id": "r2", "timestamp": 1, "cost": 1, "chain": ["A"], "principal": "beta", "weight": 2e-10},
+            ],
+            "window_seconds": 10,
+        },
+    )
+    assert response.status_code == 200
+    g = response.json()["global_report"]
+    assert g["weighted_jain_index"] == pytest.approx(8 / 9, abs=1e-9)
+    weights = {p["principal"]: p["weight"] for p in g["principals"]}
+    assert weights == {"alpha": 1e-10, "beta": 2e-10}
+    shares = {p["principal"]: p["theoretical_share"] for p in g["principals"]}
+    assert shares["alpha"] == pytest.approx(2 / 3, abs=1e-9)
+    assert shares["beta"] == pytest.approx(4 / 3, abs=1e-9)
+
+
+def test_http_inconsistent_tiny_weight_is_422():
+    # 1e-10 与 2e-10 是不同权重：按真实数值判定，422 定位到请求的 weight
+    response = client.post(
+        "/fairness-report",
+        json={
+            "buckets": [{"id": "A", "capacity": 10, "refill_rate": 0}],
+            "requests": [
+                {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "p", "weight": 1e-10},
+                {"id": "r2", "timestamp": 1, "cost": 1, "chain": ["A"], "principal": "p", "weight": 2e-10},
+            ],
+            "window_seconds": 1,
+        },
+    )
+    assert response.status_code == 422
+    matches = [
+        e
+        for e in response.json()["detail"]
+        if e["type"] == "inconsistent_principal_weight"
+    ]
+    assert len(matches) == 1
+    assert matches[0]["loc"] == ["requests", 1, "weight"]
 
 
 def test_http_missing_principal_is_422():
